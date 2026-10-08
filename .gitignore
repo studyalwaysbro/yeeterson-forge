@@ -1,0 +1,8 @@
+# your own setup and anything the forge writes at run time
+forge.json
+curseforge.key
+state.json
+cache/
+backups/
+logs/
+__pycache__/
