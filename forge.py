@@ -10,6 +10,7 @@
   yforge import <file.zip> ...        install a zip you downloaded yourself, after verifying it
   yforge init [path] [--flavor NAME]  find the game and write a starting forge.json
   yforge timer on|off                 check for updates every 10 minutes (systemd user timer)
+  yforge self-update                  update the forge itself from its newest GitHub release
   yforge doctor                       show paths, the key source and whether the game is running
 
 One file, standard library only, no telemetry, no account. It talks to api.curseforge.com and
@@ -34,9 +35,12 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 API = "https://api.curseforge.com/v1"
 GITHUB = "https://api.github.com"
+SELF_REPO = "studyalwaysbro/yeeterson-forge"
+SELF_CHECK_SECONDS = 3600
+SLUG = re.compile(r"[a-z0-9][a-z0-9._-]*")
 USER_AGENT = f"yeeterson-forge/{VERSION}"
 KEY_NAME = "CURSEFORGE_API_KEY"
 CHANNELS = {"release": 1, "beta": 2, "alpha": 3}
@@ -51,6 +55,7 @@ DEFAULT_CONFIG = {
     "addon_dirs": [],
     "import_dirs": ["~/Downloads"],
     "keep_backups": 3,
+    "self_update": True,
     "addons": [],
 }
 QUIET = False
@@ -126,8 +131,14 @@ def addon_dirs(cfg):
 # Network. Everything that leaves the machine goes through these two functions.
 # ---------------------------------------------------------------------------
 
+def require_https(url):
+    if not str(url).startswith("https://"):
+        raise ForgeError(f"refusing a link that is not https: {url}")
+
+
 def http_json(url, headers):
     """GET a JSON document. Returns (data, response headers); data is None on 304 Not Modified."""
+    require_https(url)
     req = urllib.request.Request(url, headers={"user-agent": USER_AGENT, **headers})
     try:
         with urllib.request.urlopen(req, timeout=30) as res:
@@ -145,10 +156,16 @@ def http_json(url, headers):
 
 
 def http_download(url, dest):
+    require_https(url)
     req = urllib.request.Request(url, headers={"user-agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=120) as res, open(dest, "wb") as out:
-            shutil.copyfileobj(res, out)
+            size = 0
+            for block in iter(lambda: res.read(1 << 20), b""):
+                size += len(block)
+                if size > MAX_UNPACKED_BYTES:
+                    raise OSError("the file is implausibly large")
+                out.write(block)
     except (urllib.error.URLError, TimeoutError, OSError) as err:
         Path(dest).unlink(missing_ok=True)
         raise ForgeError(f"download failed: {getattr(err, 'reason', err)}") from None
@@ -222,16 +239,25 @@ def sha1_values(file):
 # GitHub releases
 # ---------------------------------------------------------------------------
 
-def github_files(repo, entry):
-    """Releases that carry a .zip, shaped like CurseForge file records. Uses the ETag so an
-    unchanged repository costs nothing against GitHub's hourly limit."""
+def github_headers(etag=None):
     headers = {"accept": "application/vnd.github+json"}
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     if token:
         headers["authorization"] = f"Bearer {token}"
-    if entry.get("gh_etag") and entry.get("gh_files") is not None:
-        headers["if-none-match"] = entry["gh_etag"]
-    releases, response = http_json(f"{GITHUB}/repos/{repo}/releases?per_page=20", headers)
+    if etag:
+        headers["if-none-match"] = etag
+    return headers
+
+
+def etag_of(response):
+    return next((v for k, v in response.items() if k.lower() == "etag"), None)
+
+
+def github_files(repo, entry):
+    """Releases that carry a .zip, shaped like CurseForge file records. Uses the ETag so an
+    unchanged repository costs nothing against GitHub's hourly limit."""
+    known = entry.get("gh_etag") if entry.get("gh_files") is not None else None
+    releases, response = http_json(f"{GITHUB}/repos/{repo}/releases?per_page=20", github_headers(known))
     if releases is None:
         return entry["gh_files"]
     files = []
@@ -249,8 +275,7 @@ def github_files(repo, entry):
             "sha256": digest[7:].lower() if digest.startswith("sha256:") else None,
         })
     files.sort(key=lambda f: f["fileDate"], reverse=True)
-    etag = next((v for k, v in response.items() if k.lower() == "etag"), None)
-    entry["gh_etag"], entry["gh_files"] = etag, files
+    entry["gh_etag"], entry["gh_files"] = etag_of(response), files
     return files
 
 
@@ -447,6 +472,74 @@ def notify(text):
 
 
 # ---------------------------------------------------------------------------
+# Updating the forge itself
+# ---------------------------------------------------------------------------
+
+def script_path():
+    return Path(__file__).resolve()
+
+
+def version_tuple(text):
+    return tuple(int(n) for n in re.findall(r"\d+", text)[:3])
+
+
+def self_update(state, force=False):
+    """Replace this file with forge.py from the newest release of SELF_REPO. Returns the new
+    version, or None when there is nothing newer. The new file must match the SHA-256 GitHub
+    recorded for it, be valid Python and carry the version its release claims; the old file is
+    kept beside it as forge.py.previous. A git checkout is left to git."""
+    script = script_path()
+    if (script.parent / ".git").exists():
+        if force:
+            raise ForgeError(f"{script.parent} is a git checkout, update it with: git pull")
+        return None
+    me = state.setdefault("_self", {})
+    me["checked"] = int(time.time())
+    release, response = http_json(f"{GITHUB}/repos/{SELF_REPO}/releases/latest", github_headers(None if force else me.get("etag")))
+    if release is None:
+        return None
+    tag = release["tag_name"]
+    if version_tuple(tag) <= version_tuple(VERSION):
+        me["etag"] = etag_of(response)
+        return None
+    asset = next((a for a in release.get("assets", []) if a["name"] == "forge.py"), None)
+    digest = (asset or {}).get("digest") or ""
+    if not digest.startswith("sha256:"):
+        raise ForgeError(f"release {tag} has no checksummed forge.py, so it was not installed")
+    new = script.with_name("forge.py.new")
+    try:
+        http_download(asset["browser_download_url"], new)
+        source = new.read_bytes()
+        if hashlib.sha256(source).hexdigest() != digest[7:].lower():
+            raise ForgeError(f"forge.py from release {tag} failed its hash check")
+        try:
+            compile(source, str(new), "exec")
+        except (SyntaxError, ValueError):
+            raise ForgeError(f"forge.py from release {tag} is not valid Python") from None
+        if f'VERSION = "{tag.lstrip("v")}"'.encode() not in source:
+            raise ForgeError(f"forge.py from release {tag} does not say it is {tag}")
+        shutil.copy2(script, script.with_name("forge.py.previous"))
+        new.chmod(0o755)
+        new.replace(script)
+    except OSError as err:
+        raise ForgeError(f"could not replace {script}: {err}") from None
+    finally:
+        new.unlink(missing_ok=True)
+    me["etag"] = etag_of(response)
+    return tag.lstrip("v")
+
+
+def cmd_self_update(state):
+    try:
+        new = self_update(state, force=True)
+    except ForgeError as err:
+        raise SystemExit(str(err)) from None
+    write_json(paths()["state.json"], state)
+    log(f"Yeeterson Forge updated itself: {VERSION} -> {new}" if new else f"Yeeterson Forge {VERSION} is the newest release.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -457,6 +550,16 @@ def file_page(entry, file):
 
 def cmd_update(cfg, state, force=False, check_only=False):
     state_path = paths()["state.json"]
+    # The forge keeps itself current too. It is not part of the game, so a running game does not delay it.
+    if not check_only and cfg.get("self_update", True) and time.time() - state.get("_self", {}).get("checked", 0) >= SELF_CHECK_SECONDS:
+        try:
+            new = self_update(state)
+            if new:
+                log(f"Yeeterson Forge updated itself: {VERSION} -> {new}. The new version runs from the next check on.")
+                notify(f"Yeeterson Forge updated itself to {new}.")
+        except ForgeError as err:
+            log(f"  could not update the forge itself: {err}")
+        write_json(state_path, state)
     if not check_only and game_running() and not force:
         log("WoW is running, so nothing was changed. Updates apply the next time it is closed.")
         return 0
@@ -477,6 +580,10 @@ def cmd_update(cfg, state, force=False, check_only=False):
         if slug in seen:
             continue
         seen.add(slug)
+        if not SLUG.fullmatch(str(slug)):
+            problems.append(f"{slug}: not a valid addon slug")
+            rows.append((str(slug), "?", "PROBLEM: not a valid addon slug"))
+            continue
         entry = state.setdefault(slug, {})
         name = entry.get("name") or slug
         try:
@@ -582,6 +689,8 @@ def cmd_add(cfg, state, spec, channel=None, force=False):
         if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
             raise SystemExit("Use github:<owner>/<repo>")
         new = {"slug": repo.split("/")[-1].lower(), "github": repo}
+        if not SLUG.fullmatch(new["slug"]):
+            raise SystemExit(f"{repo} cannot be used as an addon name")
     elif not re.fullmatch(r"[a-z0-9-]+", spec):
         raise SystemExit("A slug is the last part of the addon's CurseForge URL, for example: questie")
     if channel:
@@ -688,24 +797,41 @@ def cmd_import(cfg, state, zips, force=False):
     return 1 if failures else 0
 
 
-WOW_SEARCH = (
-    "Games/*/drive_c/Program Files (x86)/World of Warcraft",
-    "Games/*/drive_c/Program Files/World of Warcraft",
-    ".wine/drive_c/Program Files (x86)/World of Warcraft",
-    ".var/app/com.usebottles.bottles/data/bottles/bottles/*/drive_c/Program Files (x86)/World of Warcraft",
-    ".local/share/bottles/bottles/*/drive_c/Program Files (x86)/World of Warcraft",
-    ".local/share/Steam/steamapps/compatdata/*/pfx/drive_c/Program Files (x86)/World of Warcraft",
-    ".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/compatdata/*/pfx/drive_c/Program Files (x86)/World of Warcraft",
-    ".local/share/lutris/runners/wine/*/drive_c/Program Files (x86)/World of Warcraft",
+# Where launchers keep their Wine prefixes, relative to the home folder: Lutris and Heroic, Faugus,
+# plain Wine, Bottles (native and Flatpak). Steam is handled apart because its libraries can be anywhere.
+PREFIX_SEARCH = (
+    "Games/*", "Games/Heroic/Prefixes/*", "Games/Heroic/Prefixes/default/*", "Faugus/*", ".wine",
+    ".local/share/bottles/bottles/*", ".var/app/com.usebottles.bottles/data/bottles/bottles/*",
+    ".local/share/lutris/runners/wine/*",
 )
+STEAM_SEARCH = (
+    ".local/share/Steam", ".steam/steam", ".steam/root", ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+    "snap/steam/common/.local/share/Steam",
+)
+GAME_SEARCH = ("drive_c/Program Files (x86)/World of Warcraft", "drive_c/Program Files/World of Warcraft")
+
+
+def steam_libraries(steam):
+    """The Steam folder itself plus every extra library listed in libraryfolders.vdf (other drives, SD cards)."""
+    try:
+        listed = re.findall(r'"path"\s+"([^"]+)"', (steam / "steamapps" / "libraryfolders.vdf").read_text(errors="replace"))
+    except OSError:
+        listed = []
+    return [steam] + [Path(p.replace("\\\\", "/")) for p in listed]
 
 
 def find_wow(base=None):
     base = Path(base) if base else Path.home()
-    found = []
-    for pattern in WOW_SEARCH:
-        found += [p for p in base.glob(pattern) if p.is_dir()]
-    return sorted(set(found))
+    prefixes = [p for pattern in PREFIX_SEARCH for p in base.glob(pattern)]
+    for pattern in STEAM_SEARCH:
+        for library in steam_libraries(base / pattern):
+            prefixes += library.glob("steamapps/compatdata/*/pfx")
+    found = set()
+    for prefix in prefixes:
+        for inner in ("", "pfx/"):
+            found.update(p.resolve() for p in prefix.glob(inner + GAME_SEARCH[0]) if p.is_dir())
+            found.update(p.resolve() for p in prefix.glob(inner + GAME_SEARCH[1]) if p.is_dir())
+    return sorted(found)
 
 
 def cmd_init(path=None, flavor=None):
@@ -715,7 +841,8 @@ def cmd_init(path=None, flavor=None):
     roots = [Path(path).expanduser().resolve()] if path else find_wow()
     roots = [r for r in roots if r.is_dir()]
     if not roots:
-        raise SystemExit('Could not find the game. Run: yforge init "/path/to/World of Warcraft"')
+        raise SystemExit('Could not find the game. Run: yforge init "/path/to/World of Warcraft"\n'
+                         "That is the folder holding _classic_beta_ (or _retail_ and friends), inside your launcher's drive_c.")
     if len(roots) > 1:
         print("Found more than one install. Pick one:")
         for root in roots:
@@ -740,19 +867,23 @@ def cmd_init(path=None, flavor=None):
         print("  1. Sign in at https://console.curseforge.com and copy the key under API keys.")
         print(f"  2. Save it as the only line of {paths()['curseforge.key']}")
         print("Addons from GitHub releases work without a key.")
-    print("\nNext: yforge add questie     then: yforge timer on")
+    print("\nNext: yforge add github:studyalwaysbro/godslayer     then: yforge timer on")
     return 0
 
 
 UNIT_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd" / "user"
 
 
+def unit_quote(text):
+    """Quote a value for a systemd unit, so a path with spaces stays one argument."""
+    return '"' + str(text).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
+
+
 def unit_files():
-    script = Path(__file__).resolve()
-    environment = f"Environment=YFORGE_HOME={HOME}\n" if os.environ.get("YFORGE_HOME") else ""
+    environment = f"Environment={unit_quote(f'YFORGE_HOME={HOME}')}\n" if os.environ.get("YFORGE_HOME") else ""
     service = (
         "[Unit]\nDescription=Yeeterson Forge: keep WoW Forever addons current\nAfter=network-online.target\n\n"
-        f"[Service]\nType=oneshot\n{environment}ExecStart={sys.executable} {script} update --quiet\nNice=10\n"
+        f"[Service]\nType=oneshot\n{environment}ExecStart={unit_quote(sys.executable)} {unit_quote(script_path())} update --quiet\nNice=10\n"
     )
     timer = (
         "[Unit]\nDescription=Yeeterson Forge: check for WoW Forever addon updates every 10 minutes\n\n"
@@ -765,6 +896,9 @@ def cmd_timer(mode):
     if mode not in ("on", "off"):
         raise SystemExit("Use: yforge timer on   or   yforge timer off")
     service_path, timer_path = UNIT_DIR / "yeeterson-forge.service", UNIT_DIR / "yeeterson-forge.timer"
+    cron = f"Add this line to your crontab (crontab -e) instead:\n*/10 * * * * '{sys.executable}' '{script_path()}' update --quiet"
+    if not shutil.which("systemctl"):
+        raise SystemExit(f"This system has no systemd. {cron}")
     systemctl = lambda *args: subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
     if mode == "off":
         systemctl("disable", "--now", "yeeterson-forge.timer")
@@ -781,6 +915,8 @@ def cmd_timer(mode):
     result = systemctl("enable", "--now", "yeeterson-forge.timer")
     if result.returncode != 0:
         raise SystemExit(f"systemd refused the timer: {result.stderr.strip()}")
+    if systemctl("is-active", "yeeterson-forge.timer").returncode != 0:
+        raise SystemExit(f"The timer is saved but systemd is not running it in this session. Log out and back in, or: {cron}")
     print("Timer on. The forge checks two minutes after login and every 10 minutes after that.")
     return 0
 
@@ -788,10 +924,16 @@ def cmd_timer(mode):
 def cmd_doctor(cfg):
     key, source = curseforge_key(cfg)
     print(f"Yeeterson Forge {VERSION}")
+    print(f"program      {script_path()}")
+    checkout = (script_path().parent / ".git").exists()
+    print(f"self-update  {'git checkout, update with git pull' if checkout else 'on' if cfg.get('self_update', True) else 'off (self_update is false in forge.json)'}")
     print(f"home         {HOME}")
     for d in addon_dirs(cfg):
         print(f"addons       {d}  {'ok' if d.is_dir() else 'MISSING'}")
     print(f"CurseForge   {'key from ' + source if key else 'no key (GitHub addons still work)'}")
+    key_file = paths()["curseforge.key"]
+    if key_file.exists() and key_file.stat().st_mode & 0o077:
+        print(f"             other users on this machine can read the key file. Fix: chmod 600 {key_file}")
     if key:
         try:
             cf(cfg, "/games/1")
@@ -828,6 +970,8 @@ def main(argv=None):
         return cmd_init(args[1] if len(args) > 1 else None, flavor)
     if command == "timer":
         return cmd_timer(args[1] if len(args) > 1 else "")
+    if command == "self-update":
+        return cmd_self_update(read_json(paths()["state.json"], {}))
     cfg = load_config()
     state = read_json(paths()["state.json"], {})
     if command == "update":

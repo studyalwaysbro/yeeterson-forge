@@ -37,32 +37,50 @@ If you want a full-featured manager for every WoW flavor, use [instawow](https:/
 | The addon is for Forever | Refused unless a `.toc` lists an interface version from 16000 to 19999 |
 | An update cannot leave you half-installed | If any step fails, every folder is put back exactly as it was |
 | Your own addons are safe | Folders the forge did not install are never modified or removed |
+| It only follows secure links | Anything that is not `https` is refused |
 | It does not phone home | It talks to `api.curseforge.com` and `api.github.com`, plus the download links they return. Nothing else. A test enforces this |
 | Your API key stays yours | Read at run time, never written to a log or state file. A test enforces this too |
 
 ## Install
 
-You need Python 3.9 or newer, which every current distro ships.
+One line, no sudo, nothing outside your home folder:
 
 ```sh
-git clone https://github.com/studyalwaysbro/yeeterson-forge.git
-cd yeeterson-forge
-mkdir -p ~/.local/bin && ln -s "$PWD/forge.py" ~/.local/bin/yforge
-yforge init
+curl -fsSL https://github.com/studyalwaysbro/yeeterson-forge/releases/latest/download/install.sh | sh -s -- github:studyalwaysbro/godslayer
 ```
 
-`yforge init` looks for the game under Lutris, Bottles, Steam and plain Wine prefixes. If it cannot find it, give it the path:
+That downloads the newest release, checks it against its published checksum, finds your game, starts managing [Godslayer](https://github.com/studyalwaysbro/godslayer) and turns on the background timer. Leave off everything after `sh` to install the forge alone. [install.sh](install.sh) is about 80 lines, so read it first if you like.
+
+If it cannot find the game, it tells you. Point it at the `World of Warcraft` folder inside your launcher's `drive_c` and switch the timer on:
 
 ```sh
 yforge init "/path/to/World of Warcraft" --flavor _classic_beta_
+yforge add github:studyalwaysbro/godslayer
+yforge timer on
 ```
+
+Prefer to do it by hand? Clone the repository, link `forge.py` as `~/.local/bin/yforge`, run `yforge init`. A git checkout is never changed by the forge; update it with `git pull`.
+
+### Which Linux
+
+Any distro with Python 3.9 or newer, and it never needs root. That includes the image-based ones where the system is read-only: **Bazzite**, SteamOS on the Steam Deck, Fedora Silverblue and Kinoite. Everything lives in your home folder.
+
+`yforge init` looks for the game in the places launchers put it: Lutris, Heroic, Faugus, Bottles (native and Flatpak), plain Wine, and Steam (native, Flatpak and Snap), including Steam libraries on another drive or an SD card.
+
+The background timer is a systemd user timer. On a distro without systemd, `yforge timer on` prints a crontab line to use instead.
+
+### The forge updates itself
+
+Installed as above, the forge checks its own GitHub releases about once an hour and replaces its one file when there is a newer one. The new file must match the SHA-256 that GitHub recorded for the release, be valid Python and carry the version the release claims, and the old file is kept next to it as `forge.py.previous`. Releases of this repository are immutable: once published, a release and its files cannot be swapped.
+
+This means you trust this repository's releases the same way you trust the addons it installs. If you would rather decide yourself, set `"self_update": false` in `forge.json` and run `yforge self-update` when you choose.
 
 ### The CurseForge key
 
 CurseForge requires every third-party tool to use an API key, and the honest way to do that is for you to use your own. It is free and takes a minute:
 
 1. Sign in at <https://console.curseforge.com> and copy the key under **API keys**.
-2. Save it as the only line of `~/.config/yeeterson-forge/curseforge.key`
+2. Save it as the only line of `~/.config/yeeterson-forge/curseforge.key`, then `chmod 600` that file.
 
 Addons that ship as GitHub releases need no key at all.
 
@@ -78,6 +96,7 @@ yforge timer on                            # or let it check every 10 minutes
 yforge rollback questie                    # that update was bad, go back
 yforge remove questie
 yforge doctor                              # paths, key, and whether the game is running
+yforge self-update                         # update the forge itself right now
 ```
 
 ## Addons that block third-party downloads
@@ -115,7 +134,7 @@ When the launch client installs into a new folder next to `_classic_beta_`, the 
 python3 -m unittest discover -s tests
 ```
 
-66 tests, no network, under a second. CurseForge and GitHub are faked in memory, so the suite covers the cases you hope never to meet: tampered downloads, zips that try to escape their folder, a disk that fills up halfway through an install.
+82 tests, no network, under a second. CurseForge and GitHub are faked in memory, so the suite covers the cases you hope never to meet: tampered downloads, zips that try to escape their folder, a disk that fills up halfway through an install, a self-update that is not what it claims to be.
 
 ## Scope
 

@@ -1,0 +1,32 @@
+# Pushing a tag like v1.2.3 runs the tests and publishes the release that installs update from.
+# The release notes are the message of the annotated tag.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tests
+        run: python3 -m unittest discover -s tests
+      - name: The tag must match VERSION in forge.py
+        env:
+          TAG: ${{ github.ref_name }}
+        run: test "v$(python3 forge.py --version)" = "$TAG"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sh -n install.sh
+          sha256sum forge.py install.sh > SHA256SUMS
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha)" --jq .message > notes.md
+          gh release create "$TAG" forge.py install.sh SHA256SUMS --repo "$GITHUB_REPOSITORY" --title "Yeeterson Forge ${TAG#v}" --notes-file notes.md --verify-tag

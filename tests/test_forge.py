@@ -114,7 +114,8 @@ class FakeWorld:
                 raise forge.ForgeError("api.github.com answered 404")
             if headers.get("if-none-match") == self.etag(repo):
                 return None, {"ETag": self.etag(repo)}
-            return json.loads(json.dumps(self.repos[repo])), {"ETag": self.etag(repo)}
+            releases = json.loads(json.dumps(self.repos[repo]))
+            return (releases[-1] if url.endswith("/releases/latest") else releases), {"ETag": self.etag(repo)}
         raise AssertionError(f"the forge contacted an unexpected host: {url}")
 
     @staticmethod
@@ -158,7 +159,7 @@ class ForgeCase(unittest.TestCase):
 
     def write_config(self, addons, **extra):
         cfg = {**forge.DEFAULT_CONFIG, "wow_root": str(self.game), "addon_dirs": [str(self.addons)],
-               "import_dirs": [str(self.downloads)], "addons": addons, **extra}
+               "import_dirs": [str(self.downloads)], "self_update": False, "addons": addons, **extra}
         forge.write_json(self.home / "forge.json", cfg)
 
     def run_forge(self, *args):
@@ -714,8 +715,26 @@ class SetupCommands(ForgeCase):
         steam = base / ".local/share/Steam/steamapps/compatdata/123/pfx/drive_c/Program Files (x86)/World of Warcraft"
         lutris.mkdir(parents=True)
         steam.mkdir(parents=True)
-        self.assertEqual(forge.find_wow(base), sorted([lutris, steam]))
+        self.assertEqual(forge.find_wow(base), sorted([lutris.resolve(), steam.resolve()]))
         self.assertEqual(forge.find_wow(self.tmp / "empty"), [])
+
+    def test_find_wow_follows_steam_libraries_on_other_drives_and_other_launchers(self):
+        base = self.tmp / "var" / "home" / "deck"
+        tail = "drive_c/Program Files (x86)/World of Warcraft"
+        card = self.tmp / "run" / "media" / "sdcard" / "SteamLibrary"
+        steam = base / ".local/share/Steam"
+        (steam / "steamapps").mkdir(parents=True)
+        (steam / "steamapps" / "libraryfolders.vdf").write_text(
+            f'"libraryfolders"\n{{\n\t"0"\n\t{{\n\t\t"path"\t\t"{steam}"\n\t}}\n\t"1"\n\t{{\n\t\t"path"\t\t"{card}"\n\t}}\n}}\n')
+        (base / ".steam").mkdir()
+        (base / ".steam" / "steam").symlink_to(steam)
+        expected = [card / "steamapps/compatdata/3141592653/pfx" / tail,
+                    base / "Games/Heroic/Prefixes/default/Battle.net/pfx" / tail,
+                    base / "Faugus/battlenet" / tail,
+                    base / ".var/app/com.usebottles.bottles/data/bottles/bottles/Gaming/drive_c/Program Files/World of Warcraft"]
+        for folder in expected:
+            folder.mkdir(parents=True)
+        self.assertEqual(forge.find_wow(base), sorted(p.resolve() for p in expected), "each install is listed once")
 
     def test_commands_without_a_config_say_what_to_do(self):
         with self.assertRaises(SystemExit) as caught:
@@ -724,17 +743,149 @@ class SetupCommands(ForgeCase):
 
     def test_unit_files_point_at_this_script_and_run_quietly(self):
         service, timer = forge.unit_files()
-        self.assertIn(f"ExecStart={sys.executable} {Path(forge.__file__).resolve()} update --quiet", service)
+        self.assertIn(f'ExecStart="{sys.executable}" "{Path(forge.__file__).resolve()}" update --quiet', service)
         self.assertIn("OnUnitActiveSec=10min", timer)
         self.assertNotIn("YFORGE_HOME", service)
         os.environ["YFORGE_HOME"] = str(self.home)
-        self.assertIn(f"Environment=YFORGE_HOME={self.home}", forge.unit_files()[0])
+        self.assertIn(f'Environment="YFORGE_HOME={self.home}"', forge.unit_files()[0])
+
+    def test_unit_files_keep_a_path_with_spaces_or_a_percent_sign_in_one_piece(self):
+        self.addCleanup(setattr, forge, "script_path", forge.script_path)
+        forge.script_path = lambda: Path("/var/home/me/My Stuff/100%/forge.py")
+        self.assertIn('"/var/home/me/My Stuff/100%%/forge.py" update --quiet', forge.unit_files()[0])
+
+    def test_timer_without_systemd_offers_a_cron_line(self):
+        saved = forge.shutil.which
+        self.addCleanup(setattr, forge.shutil, "which", saved)
+        forge.shutil.which = lambda name: None
+        with self.assertRaises(SystemExit) as caught:
+            self.run_forge("timer", "on")
+        self.assertIn("*/10 * * * *", str(caught.exception))
 
     def test_version_and_help(self):
         self.assertEqual(self.run_forge("--version"), 0)
         self.assertEqual(self.run_forge("help"), 0)
         self.run_forge("init", str(self.game))
         self.assertEqual(self.run_forge("nonsense"), 2)
+
+
+class SelfUpdate(ForgeCase):
+    """The forge replaces its own file only with a release that proves itself."""
+
+    def setUp(self):
+        super().setUp()
+        self.script = self.tmp / "share" / "forge.py"
+        self.script.parent.mkdir()
+        self.script.write_text("# the installed forge\n")
+        saved = forge.script_path
+        self.addCleanup(setattr, forge, "script_path", saved)
+        forge.script_path = lambda: self.script
+        self.write_config([], self_update=True)
+
+    def publish(self, version, source=None, **kwargs):
+        source = source if source is not None else f'VERSION = "{version}"\nprint("new forge")\n'
+        self.world.add_release(forge.SELF_REPO, f"v{version}", source.encode(), asset_name="forge.py", **kwargs)
+        return source
+
+    def test_a_newer_release_replaces_the_file_and_keeps_the_old_one(self):
+        source = self.publish("99.0.0")
+        self.assertEqual(self.run_forge("update"), 0)
+        self.assertEqual(self.script.read_text(), source)
+        self.assertTrue(os.access(self.script, os.X_OK))
+        self.assertEqual(self.script.with_name("forge.py.previous").read_text(), "# the installed forge\n")
+        self.assertTrue(any("updated itself to 99.0.0" in n for n in self.notes))
+        self.assertIn("updated itself", self.log_text())
+
+    def test_it_updates_even_while_the_game_is_running(self):
+        self.publish("99.0.0")
+        self.running = True
+        self.run_forge("update")
+        self.assertIn("99.0.0", self.script.read_text())
+
+    def test_the_same_or_an_older_release_changes_nothing(self):
+        self.publish(forge.VERSION)
+        self.publish("0.0.1")
+        self.run_forge("update")
+        self.assertEqual(self.script.read_text(), "# the installed forge\n")
+        self.assertFalse(self.script.with_name("forge.py.previous").exists())
+
+    def test_a_release_without_a_checksum_is_refused(self):
+        self.publish("99.0.0", digest=False)
+        self.run_forge("update")
+        self.assertEqual(self.script.read_text(), "# the installed forge\n")
+        self.assertIn("no checksummed forge.py", self.log_text())
+
+    def test_a_tampered_download_is_refused_and_leaves_no_litter(self):
+        self.publish("99.0.0")
+        url = f"https://github.com/{forge.SELF_REPO}/releases/download/v99.0.0/forge.py"
+        self.world.blobs[url] = b'VERSION = "99.0.0"\nimport os; os.system("evil")\n'
+        self.run_forge("update")
+        self.assertEqual(self.script.read_text(), "# the installed forge\n")
+        self.assertIn("failed its hash check", self.log_text())
+        self.assertEqual(sorted(p.name for p in self.script.parent.iterdir()), ["forge.py"])
+
+    def test_a_file_that_is_not_python_or_claims_the_wrong_version_is_refused(self):
+        self.publish("99.0.0", source='VERSION = "99.0.0"\nthis is not python (\n')
+        self.run_forge("update")
+        self.assertIn("not valid Python", self.log_text())
+        self.publish("99.1.0", source='VERSION = "1.0.0"\n')
+        with self.assertRaises(SystemExit) as caught:
+            self.run_forge("self-update")
+        self.assertIn("does not say it is v99.1.0", str(caught.exception))
+        self.assertEqual(self.script.read_text(), "# the installed forge\n")
+
+    def test_it_asks_at_most_once_an_hour_and_can_be_switched_off(self):
+        self.run_forge("update")
+        self.run_forge("update")
+        self.assertEqual(len([c for c in self.world.calls if c.endswith("/releases/latest")]), 1)
+        self.write_config([], self_update=False)
+        (self.home / "state.json").unlink()
+        self.world.calls.clear()
+        self.publish("99.0.0")
+        self.run_forge("update")
+        self.assertEqual(self.world.calls, [])
+        self.assertEqual(self.script.read_text(), "# the installed forge\n")
+
+    def test_status_never_updates_the_forge(self):
+        self.publish("99.0.0")
+        self.run_forge("status")
+        self.assertEqual(self.script.read_text(), "# the installed forge\n")
+
+    def test_a_git_checkout_is_left_to_git(self):
+        (self.script.parent / ".git").mkdir()
+        self.publish("99.0.0")
+        self.run_forge("update")
+        self.assertEqual(self.world.calls, [])
+        with self.assertRaises(SystemExit) as caught:
+            self.run_forge("self-update")
+        self.assertIn("git pull", str(caught.exception))
+
+    def test_being_offline_is_reported_and_is_not_a_problem_for_the_addons(self):
+        self.world.offline = True
+        self.assertEqual(self.run_forge("update"), 0)
+        self.assertIn("could not update the forge itself", self.log_text())
+
+    def test_the_manual_command_reports_the_newest_release(self):
+        self.publish("99.0.0")
+        self.assertEqual(self.run_forge("self-update"), 0)
+        self.assertIn("99.0.0", self.script.read_text())
+
+
+class Hardening(ForgeCase):
+    def test_a_slug_that_could_escape_a_folder_or_clash_with_bookkeeping_is_refused(self):
+        self.write_config([{"slug": ".."}, {"slug": "_told"}, {"slug": "a/b"}])
+        self.assertEqual(self.run_forge("update"), 1)
+        self.assertEqual(self.world.calls, [])
+        self.assertNotIn("..", self.state())
+        for spec in ("github:owner/..", "github:owner/_self"):
+            with self.assertRaises(SystemExit):
+                self.run_forge("add", spec)
+
+    def test_only_https_links_are_followed(self):
+        for url in ("http://api.github.com/x", "file:///etc/passwd", "ftp://example.com/a.zip"):
+            with self.assertRaises(forge.ForgeError):
+                forge.require_https(url)
+        forge.require_https("https://api.github.com/x")
 
 
 class Helpers(unittest.TestCase):
